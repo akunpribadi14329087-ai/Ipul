@@ -1,0 +1,152 @@
+name: IPUL RDP WINDOWS 10 & 11
+
+on:
+  workflow_dispatch:
+    inputs:
+      windows_version:
+        description: "Pilih versi Windows"
+        required: true
+        type: choice
+        options:
+          - win11
+          - win10
+
+      rdp_username:
+        description: "Masukkan Username RDP"
+        required: true
+        type: string
+        default: "IpulAdmin"
+
+      rdp_password:
+        description: "Masukkan Password RDP"
+        required: true
+        type: string
+
+      tailscale_key:
+        description: "Tailscale Key (Windows 11)"
+        required: false
+        type: string
+
+      ngrok_key:
+        description: "Ngrok Key (Windows 10)"
+        required: false
+        type: string
+
+jobs:
+  rdp:
+    runs-on: [self-hosted, Windows, "${{ inputs.windows_version }}"]
+
+    steps:
+      - name: Check Configuration
+        shell: powershell
+        env:
+          VERSION: ${{ inputs.windows_version }}
+          TS_KEY: ${{ inputs.tailscale_key }}
+          NGROK_KEY: ${{ inputs.ngrok_key }}
+          RDP_USER: ${{ inputs.rdp_username }}
+          RDP_PASS: ${{ inputs.rdp_password }}
+        run: |
+          if ($env:VERSION -eq "win11" -and !$env:TS_KEY) {
+            throw "Tailscale key wajib diisi"
+          }
+
+          if ($env:VERSION -eq "win10" -and !$env:NGROK_KEY) {
+            throw "Ngrok key wajib diisi"
+          }
+
+          if ($env:RDP_PASS.Length -lt 12) {
+            throw "Password minimal 12 karakter"
+          }
+
+      - name: Configure RDP Account
+        shell: powershell
+        env:
+          RDP_USER: ${{ inputs.rdp_username }}
+          RDP_PASS: ${{ inputs.rdp_password }}
+        run: |
+          $secure = ConvertTo-SecureString `
+            $env:RDP_PASS -AsPlainText -Force
+
+          $existing = Get-LocalUser `
+            -Name $env:RDP_USER `
+            -ErrorAction SilentlyContinue
+
+          if ($existing) {
+            Set-LocalUser -Name $env:RDP_USER -Password $secure
+          } else {
+            New-LocalUser -Name $env:RDP_USER `
+              -Password $secure
+          }
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $env:RDP_USER `
+            -ErrorAction SilentlyContinue
+
+          Set-ItemProperty `
+            "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name fDenyTSConnections -Value 0
+
+          Enable-NetFirewallRule `
+            -Name "RemoteDesktop-UserMode-In-TCP"
+
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService
+
+      - name: Install Tailscale Windows 11
+        if: inputs.windows_version == 'win11'
+        shell: powershell
+        env:
+          TS_KEY: ${{ inputs.tailscale_key }}
+        run: |
+          winget install --id Tailscale.Tailscale `
+            --silent --accept-package-agreements `
+            --accept-source-agreements
+
+          tailscale up --authkey="$env:TS_KEY" `
+            --hostname=ipul-win11
+
+          Write-Host "TAILSCALE IP:"
+          tailscale ip -4
+
+      - name: Install Ngrok Windows 10
+        if: inputs.windows_version == 'win10'
+        shell: powershell
+        env:
+          NGROK_KEY: ${{ inputs.ngrok_key }}
+        run: |
+          winget install --id ngrok.ngrok `
+            --silent --accept-package-agreements `
+            --accept-source-agreements
+
+          ngrok config add-authtoken "$env:NGROK_KEY"
+
+          Start-Process ngrok `
+            -ArgumentList "tcp 3389" `
+            -WindowStyle Hidden
+
+          Start-Sleep -Seconds 10
+
+          $tunnel = Invoke-RestMethod `
+            "http://127.0.0.1:4040/api/tunnels"
+
+          $endpoint = $tunnel.tunnels |
+            Where-Object { $_.proto -eq "tcp" } |
+            Select-Object -First 1
+
+          if (!$endpoint) {
+            throw "Ngrok tunnel tidak ditemukan"
+          }
+
+          Write-Host "NGROK RDP ADDRESS:"
+          Write-Host $endpoint.public_url
+
+      - name: RDP Status
+        shell: powershell
+        run: |
+          Write-Host "===== IPUL RDP ====="
+          Write-Host "RDP SERVICE:"
+          Get-Service TermService
+          Write-Host "RDP PORT:"
+          Get-NetTCPConnection -LocalPort 3389 `
+            -State Listen
